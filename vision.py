@@ -51,7 +51,8 @@ stable_detector = StableDetector()
 def show_hsv_values(event, x, y, _flags, param):
     if event == cv2.EVENT_MOUSEMOVE:
         hsv_frame = cv2.cvtColor(param, cv2.COLOR_BGR2HSV)
-        print("HSV at", (x, y), ":", hsv_frame[y, x])
+        ycrcb_frame = cv2.cvtColor(param, cv2.COLOR_BGR2YCrCb)
+        print(f"HSV: {hsv_frame[y, x]} | YCrCb: {ycrcb_frame[y, x]} at ({x}, {y})")
 
 def is_semicircle(contour, min_area=500):
     """
@@ -146,16 +147,29 @@ def get_dominant_color(contour, mask_green, mask_purple):
     return None
 
 
+# Default green thresholds (can be tuned with green_tuner())
+GREEN_HSV_LOWER = np.array([35, 40, 40])
+GREEN_HSV_UPPER = np.array([85, 255, 255])
+GREEN_YCRCB_LOWER = np.array([40, 0, 0])
+GREEN_YCRCB_UPPER = np.array([220, 115, 135])
+
+
 def runPipeline(image, use_stabilization=True):
     global stable_detector
     output = image.copy()
+
+    # Convert to both color spaces
     img_hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    img_ycrcb = cv2.cvtColor(image, cv2.COLOR_BGR2YCrCb)
 
-    # HSV ranges - tuned for your balls
-    lower_green, upper_green = (72, 101, 24), (118, 19, 223)  # Lowered S,V for better green pickup
+    # Green detection using DUAL MASK (HSV AND YCrCb)
+    # A pixel must pass BOTH filters to be considered green
+    mask_green_hsv = cv2.inRange(img_hsv, GREEN_HSV_LOWER, GREEN_HSV_UPPER)
+    mask_green_ycrcb = cv2.inRange(img_ycrcb, GREEN_YCRCB_LOWER, GREEN_YCRCB_UPPER)
+    mask_green_raw = cv2.bitwise_and(mask_green_hsv, mask_green_ycrcb)
+
+    # HSV ranges for purple detection (kept as before)
     lower_purple, upper_purple = (134, 50, 80), (170, 255, 255)
-
-    mask_green_raw = cv2.inRange(img_hsv, lower_green, upper_green)
     mask_purple_raw = cv2.inRange(img_hsv, lower_purple, upper_purple)
 
     # Process each color mask SEPARATELY with appropriate morphology
@@ -270,29 +284,39 @@ def hsv_checker():
     cap = cv2.VideoCapture(0)
 
     hsv_values = []
+    ycrcb_values = []
 
     def on_click(event, x, y, _flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
-            frame, hsv_frame = param
+            frame, hsv_frame, ycrcb_frame = param
             hsv = hsv_frame[y, x]
+            ycrcb = ycrcb_frame[y, x]
             bgr = frame[y, x]
             print(f"\n{'='*40}")
             print(f"Position: ({x}, {y})")
             print(f"HSV: H={hsv[0]}, S={hsv[1]}, V={hsv[2]}")
+            print(f"YCrCb: Y={ycrcb[0]}, Cr={ycrcb[1]}, Cb={ycrcb[2]}")
             print(f"BGR: B={bgr[0]}, G={bgr[1]}, R={bgr[2]}")
             hsv_values.append(hsv)
+            ycrcb_values.append(ycrcb)
 
             if len(hsv_values) > 1:
                 h_vals = [v[0] for v in hsv_values]
                 s_vals = [v[1] for v in hsv_values]
                 v_vals = [v[2] for v in hsv_values]
-                print(f"\n--- Suggested range from {len(hsv_values)} samples ---")
+                y_vals = [v[0] for v in ycrcb_values]
+                cr_vals = [v[1] for v in ycrcb_values]
+                cb_vals = [v[2] for v in ycrcb_values]
+                print(f"\n--- Suggested HSV range from {len(hsv_values)} samples ---")
                 print(f"Lower: ({min(h_vals)-5}, {max(0, min(s_vals)-20)}, {max(0, min(v_vals)-20)})")
                 print(f"Upper: ({max(h_vals)+5}, {min(255, max(s_vals)+20)}, {min(255, max(v_vals)+20)})")
+                print(f"\n--- Suggested YCrCb range from {len(ycrcb_values)} samples ---")
+                print(f"Lower: ({max(0, min(y_vals)-20)}, {max(0, min(cr_vals)-10)}, {max(0, min(cb_vals)-10)})")
+                print(f"Upper: ({min(255, max(y_vals)+20)}, {min(255, max(cr_vals)+10)}, {min(255, max(cb_vals)+10)})")
 
     cv2.namedWindow("HSV Checker")
-    print("HSV Checker Started")
-    print("- LEFT CLICK on colors to sample HSV values")
+    print("HSV/YCrCb Checker Started")
+    print("- LEFT CLICK on colors to sample values")
     print("- Press 'c' to clear samples")
     print("- Press 'q' to quit")
 
@@ -302,10 +326,11 @@ def hsv_checker():
             break
 
         hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        cv2.setMouseCallback("HSV Checker", on_click, (frame, hsv_frame))
+        ycrcb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+        cv2.setMouseCallback("HSV Checker", on_click, (frame, hsv_frame, ycrcb_frame))
 
         # Draw instructions on frame
-        cv2.putText(frame, "Click to sample HSV | 'c'=clear | 'q'=quit",
+        cv2.putText(frame, "Click to sample HSV/YCrCb | 'c'=clear | 'q'=quit",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         cv2.putText(frame, f"Samples: {len(hsv_values)}",
                     (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
@@ -317,6 +342,7 @@ def hsv_checker():
             break
         elif key == ord('c'):
             hsv_values.clear()
+            ycrcb_values.clear()
             print("\nSamples cleared!")
 
     cap.release()
@@ -329,14 +355,263 @@ def hsv_checker():
         h_vals = [v[0] for v in hsv_values]
         s_vals = [v[1] for v in hsv_values]
         v_vals = [v[2] for v in hsv_values]
+        y_vals = [v[0] for v in ycrcb_values]
+        cr_vals = [v[1] for v in ycrcb_values]
+        cb_vals = [v[2] for v in ycrcb_values]
         print(f"Collected {len(hsv_values)} samples")
+        print(f"\nHSV ranges:")
         print(f"H range: {min(h_vals)} - {max(h_vals)}")
         print(f"S range: {min(s_vals)} - {max(s_vals)}")
         print(f"V range: {min(v_vals)} - {max(v_vals)}")
-        print(f"\nSuggested threshold:")
+        print(f"\nSuggested HSV threshold:")
         print(f"lower = ({max(0, min(h_vals)-5)}, {max(0, min(s_vals)-20)}, {max(0, min(v_vals)-20)})")
         print(f"upper = ({min(179, max(h_vals)+5)}, {min(255, max(s_vals)+20)}, {min(255, max(v_vals)+20)})")
+        print(f"\nYCrCb ranges:")
+        print(f"Y range: {min(y_vals)} - {max(y_vals)}")
+        print(f"Cr range: {min(cr_vals)} - {max(cr_vals)}")
+        print(f"Cb range: {min(cb_vals)} - {max(cb_vals)}")
+        print(f"\nSuggested YCrCb threshold:")
+        print(f"lower = ({max(0, min(y_vals)-20)}, {max(0, min(cr_vals)-10)}, {max(0, min(cb_vals)-10)})")
+        print(f"upper = ({min(255, max(y_vals)+20)}, {min(255, max(cr_vals)+10)}, {min(255, max(cb_vals)+10)})")
 
 # Uncomment to run:
-hsv_checker()
+# hsv_checker()
+
+# %%
+# GREEN DUAL-MASK TUNER
+# Tune both HSV and YCrCb thresholds with real-time visual feedback
+import cv2
+import numpy as np
+from collections import deque
+def green_tuner():
+    """
+    Interactive tuner for green ball detection using dual HSV + YCrCb masks.
+    Shows individual masks and the combined AND result.
+    Press 's' to save values, 'q' to quit.
+    """
+    cap = cv2.VideoCapture(0)
+
+    # Create windows
+    cv2.namedWindow("Controls", cv2.WINDOW_NORMAL)
+    cv2.namedWindow("Original + Detection")
+    cv2.namedWindow("HSV Mask")
+    cv2.namedWindow("YCrCb Mask")
+    cv2.namedWindow("Combined (AND)")
+
+    # HSV trackbars (H: 0-179, S: 0-255, V: 0-255)
+    cv2.createTrackbar("H_min", "Controls", 35, 179, lambda x: None)
+    cv2.createTrackbar("H_max", "Controls", 85, 179, lambda x: None)
+    cv2.createTrackbar("S_min", "Controls", 40, 255, lambda x: None)
+    cv2.createTrackbar("S_max", "Controls", 255, 255, lambda x: None)
+    cv2.createTrackbar("V_min", "Controls", 40, 255, lambda x: None)
+    cv2.createTrackbar("V_max", "Controls", 255, 255, lambda x: None)
+
+    # YCrCb trackbars (all 0-255)
+    cv2.createTrackbar("Y_min", "Controls", 40, 255, lambda x: None)
+    cv2.createTrackbar("Y_max", "Controls", 220, 255, lambda x: None)
+    cv2.createTrackbar("Cr_min", "Controls", 0, 255, lambda x: None)
+    cv2.createTrackbar("Cr_max", "Controls", 115, 255, lambda x: None)
+    cv2.createTrackbar("Cb_min", "Controls", 0, 255, lambda x: None)
+    cv2.createTrackbar("Cb_max", "Controls", 135, 255, lambda x: None)
+
+    # Morphology controls
+    cv2.createTrackbar("Morph_kernel", "Controls", 5, 15, lambda x: None)
+    cv2.createTrackbar("Open_iter", "Controls", 1, 5, lambda x: None)
+    cv2.createTrackbar("Close_iter", "Controls", 2, 5, lambda x: None)
+
+    # Step size for keyboard adjustments
+    STEP_H = 2
+    STEP_SV = 5
+    STEP_YCRCB = 5
+
+    print("="*60)
+    print("GREEN DUAL-MASK TUNER")
+    print("="*60)
+    print("Use KEYBOARD to tune (sliders may not work on macOS)")
+    print("Goal: Green ball = WHITE, everything else = BLACK")
+    print("")
+    print("KEYBOARD CONTROLS:")
+    print("  HSV Hue:        1/! = H_min -/+     2/@ = H_max -/+")
+    print("  HSV Sat:        3/# = S_min -/+     4/$ = S_max -/+")
+    print("  HSV Val:        5/% = V_min -/+     6/^ = V_max -/+")
+    print("  YCrCb Y:        7/& = Y_min -/+     8/* = Y_max -/+")
+    print("  YCrCb Cr:       9/( = Cr_min -/+    0/) = Cr_max -/+")
+    print("  YCrCb Cb:       -/_ = Cb_min -/+    =/+ = Cb_max -/+")
+    print("")
+    print("  s = Save values    r = Reset    q = Quit")
+    print("="*60)
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Get trackbar values
+        h_min = cv2.getTrackbarPos("H_min", "Controls")
+        h_max = cv2.getTrackbarPos("H_max", "Controls")
+        s_min = cv2.getTrackbarPos("S_min", "Controls")
+        s_max = cv2.getTrackbarPos("S_max", "Controls")
+        v_min = cv2.getTrackbarPos("V_min", "Controls")
+        v_max = cv2.getTrackbarPos("V_max", "Controls")
+
+        y_min = cv2.getTrackbarPos("Y_min", "Controls")
+        y_max = cv2.getTrackbarPos("Y_max", "Controls")
+        cr_min = cv2.getTrackbarPos("Cr_min", "Controls")
+        cr_max = cv2.getTrackbarPos("Cr_max", "Controls")
+        cb_min = cv2.getTrackbarPos("Cb_min", "Controls")
+        cb_max = cv2.getTrackbarPos("Cb_max", "Controls")
+
+        morph_k = max(1, cv2.getTrackbarPos("Morph_kernel", "Controls"))
+        open_iter = max(1, cv2.getTrackbarPos("Open_iter", "Controls"))
+        close_iter = max(1, cv2.getTrackbarPos("Close_iter", "Controls"))
+
+        # Convert color spaces
+        img_hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        img_ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+
+        # Create masks
+        lower_hsv = np.array([h_min, s_min, v_min])
+        upper_hsv = np.array([h_max, s_max, v_max])
+        mask_hsv = cv2.inRange(img_hsv, lower_hsv, upper_hsv)
+
+        lower_ycrcb = np.array([y_min, cr_min, cb_min])
+        upper_ycrcb = np.array([y_max, cr_max, cb_max])
+        mask_ycrcb = cv2.inRange(img_ycrcb, lower_ycrcb, upper_ycrcb)
+
+        # Combined mask (AND operation)
+        mask_combined = cv2.bitwise_and(mask_hsv, mask_ycrcb)
+
+        # Apply morphology to combined
+        kernel = np.ones((morph_k, morph_k), np.uint8)
+        mask_clean = cv2.morphologyEx(mask_combined, cv2.MORPH_OPEN, kernel, iterations=open_iter)
+        mask_clean = cv2.morphologyEx(mask_clean, cv2.MORPH_CLOSE, kernel, iterations=close_iter)
+
+        # Find contours and draw on output
+        output = frame.copy()
+        contours, _ = cv2.findContours(mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = [c for c in contours if cv2.contourArea(c) > 500]
+
+        for i, contour in enumerate(contours):
+            cv2.drawContours(output, [contour], -1, (0, 255, 0), 2)
+            x, y, w, h = cv2.boundingRect(contour)
+            area = cv2.contourArea(contour)
+            cv2.putText(output, f"A:{area}", (x, y - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+        # Count pixels for feedback
+        hsv_pixels = cv2.countNonZero(mask_hsv)
+        ycrcb_pixels = cv2.countNonZero(mask_ycrcb)
+        combined_pixels = cv2.countNonZero(mask_clean)
+
+        # Add info text - current values and pixel counts
+        cv2.putText(output, f"HSV: H[{h_min}-{h_max}] S[{s_min}-{s_max}] V[{v_min}-{v_max}]",
+                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+        cv2.putText(output, f"YCrCb: Y[{y_min}-{y_max}] Cr[{cr_min}-{cr_max}] Cb[{cb_min}-{cb_max}]",
+                    (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+        cv2.putText(output, f"Pixels: HSV={hsv_pixels} YCrCb={ycrcb_pixels} Combined={combined_pixels} | Contours: {len(contours)}",
+                    (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+
+        # Show windows
+        cv2.imshow("Original + Detection", output)
+        cv2.imshow("HSV Mask", mask_hsv)
+        cv2.imshow("YCrCb Mask", mask_ycrcb)
+        cv2.imshow("Combined (AND)", mask_clean)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('s'):
+            print("\n" + "="*60)
+            print("SAVED VALUES - Copy these to vision.py:")
+            print("="*60)
+            print(f"GREEN_HSV_LOWER = np.array([{h_min}, {s_min}, {v_min}])")
+            print(f"GREEN_HSV_UPPER = np.array([{h_max}, {s_max}, {v_max}])")
+            print(f"GREEN_YCRCB_LOWER = np.array([{y_min}, {cr_min}, {cb_min}])")
+            print(f"GREEN_YCRCB_UPPER = np.array([{y_max}, {cr_max}, {cb_max}])")
+            print(f"# Morphology: kernel={morph_k}, open_iter={open_iter}, close_iter={close_iter}")
+            print("="*60 + "\n")
+        elif key == ord('r'):
+            # Reset to defaults
+            cv2.setTrackbarPos("H_min", "Controls", 35)
+            cv2.setTrackbarPos("H_max", "Controls", 85)
+            cv2.setTrackbarPos("S_min", "Controls", 40)
+            cv2.setTrackbarPos("S_max", "Controls", 255)
+            cv2.setTrackbarPos("V_min", "Controls", 40)
+            cv2.setTrackbarPos("V_max", "Controls", 255)
+            cv2.setTrackbarPos("Y_min", "Controls", 40)
+            cv2.setTrackbarPos("Y_max", "Controls", 220)
+            cv2.setTrackbarPos("Cr_min", "Controls", 0)
+            cv2.setTrackbarPos("Cr_max", "Controls", 115)
+            cv2.setTrackbarPos("Cb_min", "Controls", 0)
+            cv2.setTrackbarPos("Cb_max", "Controls", 135)
+            print("Reset to defaults!")
+
+        # Keyboard controls for tuning (number keys and shift+number)
+        # H_min: 1/!
+        elif key == ord('1'):
+            cv2.setTrackbarPos("H_min", "Controls", max(0, h_min - STEP_H))
+        elif key == ord('!'):
+            cv2.setTrackbarPos("H_min", "Controls", min(179, h_min + STEP_H))
+        # H_max: 2/@
+        elif key == ord('2'):
+            cv2.setTrackbarPos("H_max", "Controls", max(0, h_max - STEP_H))
+        elif key == ord('@'):
+            cv2.setTrackbarPos("H_max", "Controls", min(179, h_max + STEP_H))
+        # S_min: 3/#
+        elif key == ord('3'):
+            cv2.setTrackbarPos("S_min", "Controls", max(0, s_min - STEP_SV))
+        elif key == ord('#'):
+            cv2.setTrackbarPos("S_min", "Controls", min(255, s_min + STEP_SV))
+        # S_max: 4/$
+        elif key == ord('4'):
+            cv2.setTrackbarPos("S_max", "Controls", max(0, s_max - STEP_SV))
+        elif key == ord('$'):
+            cv2.setTrackbarPos("S_max", "Controls", min(255, s_max + STEP_SV))
+        # V_min: 5/%
+        elif key == ord('5'):
+            cv2.setTrackbarPos("V_min", "Controls", max(0, v_min - STEP_SV))
+        elif key == ord('%'):
+            cv2.setTrackbarPos("V_min", "Controls", min(255, v_min + STEP_SV))
+        # V_max: 6/^
+        elif key == ord('6'):
+            cv2.setTrackbarPos("V_max", "Controls", max(0, v_max - STEP_SV))
+        elif key == ord('^'):
+            cv2.setTrackbarPos("V_max", "Controls", min(255, v_max + STEP_SV))
+        # Y_min: 7/&
+        elif key == ord('7'):
+            cv2.setTrackbarPos("Y_min", "Controls", max(0, y_min - STEP_YCRCB))
+        elif key == ord('&'):
+            cv2.setTrackbarPos("Y_min", "Controls", min(255, y_min + STEP_YCRCB))
+        # Y_max: 8/*
+        elif key == ord('8'):
+            cv2.setTrackbarPos("Y_max", "Controls", max(0, y_max - STEP_YCRCB))
+        elif key == ord('*'):
+            cv2.setTrackbarPos("Y_max", "Controls", min(255, y_max + STEP_YCRCB))
+        # Cr_min: 9/(
+        elif key == ord('9'):
+            cv2.setTrackbarPos("Cr_min", "Controls", max(0, cr_min - STEP_YCRCB))
+        elif key == ord('('):
+            cv2.setTrackbarPos("Cr_min", "Controls", min(255, cr_min + STEP_YCRCB))
+        # Cr_max: 0/)
+        elif key == ord('0'):
+            cv2.setTrackbarPos("Cr_max", "Controls", max(0, cr_max - STEP_YCRCB))
+        elif key == ord(')'):
+            cv2.setTrackbarPos("Cr_max", "Controls", min(255, cr_max + STEP_YCRCB))
+        # Cb_min: -/_
+        elif key == ord('-'):
+            cv2.setTrackbarPos("Cb_min", "Controls", max(0, cb_min - STEP_YCRCB))
+        elif key == ord('_'):
+            cv2.setTrackbarPos("Cb_min", "Controls", min(255, cb_min + STEP_YCRCB))
+        # Cb_max: =/+
+        elif key == ord('='):
+            cv2.setTrackbarPos("Cb_max", "Controls", max(0, cb_max - STEP_YCRCB))
+        elif key == ord('+'):
+            cv2.setTrackbarPos("Cb_max", "Controls", min(255, cb_max + STEP_YCRCB))
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+# Run the tuner:
+green_tuner()
 # %%
