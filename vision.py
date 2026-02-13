@@ -1,8 +1,54 @@
 #%%
 import cv2
 import numpy as np
+from collections import deque
 
-def show_hsv_values(event, x, y, flags, param):
+# Temporal smoothing: track last N frames for stable detection
+class StableDetector:
+    def __init__(self, history_size=10, stability_threshold=0.6):
+        self.history = deque(maxlen=history_size)
+        self.stability_threshold = stability_threshold
+        self.locked_motif = ""
+        self.lock_frames = 0
+        self.LOCK_DURATION = 15  # Frames to hold a motif before allowing change
+
+    def update(self, current_motif):
+        self.history.append(current_motif)
+
+        if len(self.history) < 3:
+            return current_motif
+
+        # Count occurrences of each motif in history
+        motif_counts = {}
+        for m in self.history:
+            motif_counts[m] = motif_counts.get(m, 0) + 1
+
+        # Find most common motif
+        most_common = max(motif_counts, key=motif_counts.get)
+        frequency = motif_counts[most_common] / len(self.history)
+
+        # If we have a locked motif, keep it unless new one is very stable
+        if self.locked_motif and self.lock_frames > 0:
+            self.lock_frames -= 1
+            # Only unlock if new motif is dominant and different
+            if frequency >= 0.8 and most_common != self.locked_motif:
+                self.locked_motif = most_common
+                self.lock_frames = self.LOCK_DURATION
+            return self.locked_motif
+
+        # Lock onto stable motif
+        if frequency >= self.stability_threshold:
+            self.locked_motif = most_common
+            self.lock_frames = self.LOCK_DURATION
+            return most_common
+
+        # Return locked motif if we have one, else most common
+        return self.locked_motif if self.locked_motif else most_common
+
+# Global detector instance
+stable_detector = StableDetector()
+
+def show_hsv_values(event, x, y, _flags, param):
     if event == cv2.EVENT_MOUSEMOVE:
         hsv_frame = cv2.cvtColor(param, cv2.COLOR_BGR2HSV)
         print("HSV at", (x, y), ":", hsv_frame[y, x])
@@ -11,6 +57,7 @@ def is_semicircle(contour, min_area=500):
     """
     Detect if a contour is a semi-circular shape.
     Returns (is_semicircle, score) where score indicates confidence.
+    Uses relaxed criteria to detect more semi-circles.
     """
     area = cv2.contourArea(contour)
     if area < min_area:
@@ -42,106 +89,164 @@ def is_semicircle(contour, min_area=500):
     if len(contour) >= 5:
         ellipse = cv2.fitEllipse(contour)
         ellipse_aspect = max(ellipse[1]) / min(ellipse[1]) if min(ellipse[1]) > 0 else 0
-        # Semi-circles when fit to ellipse have aspect ratio ~1.5-2.5
-        if 1.3 < ellipse_aspect < 3.0:
+        # Semi-circles when fit to ellipse have aspect ratio ~1.2-3.5 (relaxed)
+        if 1.2 < ellipse_aspect < 3.5:
             ellipse_match = 1
 
-    # Semi-circle criteria:
-    # - Circularity between 0.4 and 0.85 (lower than full circle)
-    # - Aspect ratio between 1.3 and 2.5 (elongated in one direction)
-    # - Extent between 0.45 and 0.75 (fills about half the bounding rect)
-    # - High solidity (convex shape)
+    # Relaxed semi-circle criteria to detect more shapes:
+    # - Circularity between 0.3 and 0.95 (wider range)
+    # - Aspect ratio between 1.1 and 3.5 (more elongation allowed)
+    # - Extent between 0.35 and 0.85 (wider fill range)
+    # - Solidity > 0.75 (slightly more irregular shapes allowed)
 
     is_semi = (
-        0.4 < circularity < 0.85 and
-        1.3 < aspect_ratio < 2.5 and
-        0.45 < extent < 0.75 and
-        solidity > 0.85
+        0.3 < circularity < 0.95 and
+        1.1 < aspect_ratio < 3.5 and
+        0.35 < extent < 0.85 and
+        solidity > 0.75
     )
 
     # Calculate confidence score
     score = 0
     if is_semi:
         # Ideal semi-circle values
-        circ_score = 1 - abs(circularity - 0.6) / 0.3
-        aspect_score = 1 - abs(aspect_ratio - 1.8) / 0.7
-        extent_score = 1 - abs(extent - 0.55) / 0.2
+        circ_score = max(0, 1 - abs(circularity - 0.6) / 0.4)
+        aspect_score = max(0, 1 - abs(aspect_ratio - 1.8) / 1.0)
+        extent_score = max(0, 1 - abs(extent - 0.55) / 0.3)
         score = area * solidity * (circ_score + aspect_score + extent_score + ellipse_match) / 4
 
     return is_semi, score
 
 
-def runPipeline(image):
+def get_dominant_color(contour, mask_green, mask_purple):
+    """
+    Determine color by sampling multiple points in the contour region.
+    Returns 'G', 'P', or None based on majority voting.
+    """
+    x, y, w, h = cv2.boundingRect(contour)
+
+    # Create a mask for just this contour
+    contour_mask = np.zeros(mask_green.shape, dtype=np.uint8)
+    cv2.drawContours(contour_mask, [contour], -1, 255, -1)
+
+    # Count pixels that match each color within the contour
+    green_pixels = cv2.countNonZero(cv2.bitwise_and(mask_green, contour_mask))
+    purple_pixels = cv2.countNonZero(cv2.bitwise_and(mask_purple, contour_mask))
+
+    total = green_pixels + purple_pixels
+    if total == 0:
+        return None
+
+    # Require at least 30% dominance to classify
+    if green_pixels > purple_pixels and green_pixels / total > 0.3:
+        return 'G'
+    elif purple_pixels > green_pixels and purple_pixels / total > 0.3:
+        return 'P'
+
+    return None
+
+
+def runPipeline(image, use_stabilization=True):
+    global stable_detector
     output = image.copy()
     img_hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
-    lower_green, upper_green = (35, 80, 80), (85, 255, 255)
-    lower_purple, upper_purple = (115, 40, 40), (170, 255, 255)
+    # HSV ranges - tuned for your balls
+    lower_green, upper_green = (72, 101, 24), (118, 19, 223)  # Lowered S,V for better green pickup
+    lower_purple, upper_purple = (134, 50, 80), (170, 255, 255)
 
-    mask_green = cv2.inRange(img_hsv, lower_green, upper_green)
-    mask_purple = cv2.inRange(img_hsv, lower_purple, upper_purple)
+    mask_green_raw = cv2.inRange(img_hsv, lower_green, upper_green)
+    mask_purple_raw = cv2.inRange(img_hsv, lower_purple, upper_purple)
+
+    # Process each color mask SEPARATELY with appropriate morphology
+    kernel = np.ones((5, 5), np.uint8)
+    kernel_large = np.ones((7, 7), np.uint8)
+
+    # Green mask cleaning
+    mask_green = cv2.morphologyEx(mask_green_raw, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_CLOSE, kernel_large, iterations=2)
+
+    # Purple mask cleaning
+    mask_purple = cv2.morphologyEx(mask_purple_raw, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask_purple = cv2.morphologyEx(mask_purple, cv2.MORPH_CLOSE, kernel_large, iterations=2)
+
+    # Combine for contour detection
     mask_combined = cv2.bitwise_or(mask_green, mask_purple)
 
-    kernel = np.ones((5, 5), np.uint8)
+    # Additional cleanup on combined
     mask_clean = cv2.morphologyEx(mask_combined, cv2.MORPH_OPEN, kernel)
-    mask_clean = cv2.morphologyEx(mask_clean, cv2.MORPH_CLOSE, kernel)
-    mask_clean = cv2.GaussianBlur(mask_clean, (5, 5), 0)
+    mask_clean = cv2.morphologyEx(mask_clean, cv2.MORPH_CLOSE, kernel_large)
 
     contours, _ = cv2.findContours(mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+    # Pre-filter by area
+    MIN_CONTOUR_AREA = 600
+    contours = [c for c in contours if cv2.contourArea(c) > MIN_CONTOUR_AREA]
+
     detected_shapes = []
-    green_candidates = []
-    purple_candidates = []
+    green_count = 0
+    purple_count = 0
 
     for contour in contours:
-        # Check if contour is a semi-circle
-        is_semi, score = is_semicircle(contour)
+        is_semi, score = is_semicircle(contour, min_area=MIN_CONTOUR_AREA)
 
         if is_semi:
             x, y, w, h = cv2.boundingRect(contour)
             center_x = x + w // 2
-            center_y = y + h // 2
 
-            if mask_green[center_y, center_x] > 0:
-                green_candidates.append((contour, x, y, w, h, center_x, center_y, score))
-            elif mask_purple[center_y, center_x] > 0:
-                purple_candidates.append((contour, x, y, w, h, center_x, center_y, score))
+            # Use robust color detection (multiple pixel sampling)
+            color = get_dominant_color(contour, mask_green, mask_purple)
 
-    if green_candidates:
-        best_green = max(green_candidates, key=lambda c: c[7])
-        contour, x, y, w, h, center_x, center_y, _ = best_green
-        detected_shapes.append((center_x, 'G'))
-        cv2.drawContours(output, [contour], -1, (0, 255, 0), 2)
-        cv2.putText(output, 'G-Semi', (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-    if purple_candidates:
-        best_purple = max(purple_candidates, key=lambda c: c[7])
-        contour, x, y, w, h, center_x, center_y, _ = best_purple
-        detected_shapes.append((center_x, 'P'))
-        cv2.drawContours(output, [contour], -1, (255, 0, 255), 2)
-        cv2.putText(output, 'P-Semi', (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+            if color == 'G':
+                green_count += 1
+                detected_shapes.append((center_x, 'G', contour, x, y, score))
+                cv2.drawContours(output, [contour], -1, (0, 255, 0), 3)
+                cv2.putText(output, f'G{green_count}', (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            elif color == 'P':
+                purple_count += 1
+                detected_shapes.append((center_x, 'P', contour, x, y, score))
+                cv2.drawContours(output, [contour], -1, (255, 0, 255), 3)
+                cv2.putText(output, f'P{purple_count}', (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
     detected_shapes.sort(key=lambda b: b[0])
-    shape_order = ''.join([b[1] for b in detected_shapes])
+    raw_motif = ''.join([b[1] for b in detected_shapes])
 
-    cv2.putText(output, f"Semi-circles: {shape_order}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    # Apply temporal stabilization
+    if use_stabilization:
+        stable_motif = stable_detector.update(raw_motif)
+    else:
+        stable_motif = raw_motif
 
-    return shape_order, output, mask_clean, mask_green, mask_purple
+    total_count = len(stable_motif)
+
+    # Show both raw and stable motif for debugging
+    cv2.putText(output, f"Stable: {stable_motif} ({total_count})", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+    cv2.putText(output, f"Raw: {raw_motif}", (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+    cv2.putText(output, f"G:{green_count} P:{purple_count}", (10, 85),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+    return stable_motif, output, mask_clean, mask_green, mask_purple
 
 
 if __name__ == "__main__":
     cap = cv2.VideoCapture(0)
     cv2.namedWindow("Color Output")
 
+    last_printed = ""
+
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        shape_order, output, mask_combined, mask_green, mask_purple = runPipeline(frame)
+        stable_motif, output, mask_combined, mask_green, mask_purple = runPipeline(frame)
 
-        if shape_order:
-            print(f"Semi-circle order (left to right): {shape_order}")
+        # Only print when motif changes (reduces console spam)
+        if stable_motif and stable_motif != last_printed:
+            print(f"Motif: {stable_motif}")
+            last_printed = stable_motif
 
         cv2.setMouseCallback("Color Output", show_hsv_values, frame)
 
@@ -157,4 +262,81 @@ if __name__ == "__main__":
     cv2.destroyAllWindows()
 
 
+# %%
+# HSV Value Checker - Click on any pixel to see its HSV values
+# Run this cell to fine-tune your color thresholds
+
+def hsv_checker():
+    cap = cv2.VideoCapture(0)
+
+    hsv_values = []
+
+    def on_click(event, x, y, _flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            frame, hsv_frame = param
+            hsv = hsv_frame[y, x]
+            bgr = frame[y, x]
+            print(f"\n{'='*40}")
+            print(f"Position: ({x}, {y})")
+            print(f"HSV: H={hsv[0]}, S={hsv[1]}, V={hsv[2]}")
+            print(f"BGR: B={bgr[0]}, G={bgr[1]}, R={bgr[2]}")
+            hsv_values.append(hsv)
+
+            if len(hsv_values) > 1:
+                h_vals = [v[0] for v in hsv_values]
+                s_vals = [v[1] for v in hsv_values]
+                v_vals = [v[2] for v in hsv_values]
+                print(f"\n--- Suggested range from {len(hsv_values)} samples ---")
+                print(f"Lower: ({min(h_vals)-5}, {max(0, min(s_vals)-20)}, {max(0, min(v_vals)-20)})")
+                print(f"Upper: ({max(h_vals)+5}, {min(255, max(s_vals)+20)}, {min(255, max(v_vals)+20)})")
+
+    cv2.namedWindow("HSV Checker")
+    print("HSV Checker Started")
+    print("- LEFT CLICK on colors to sample HSV values")
+    print("- Press 'c' to clear samples")
+    print("- Press 'q' to quit")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        cv2.setMouseCallback("HSV Checker", on_click, (frame, hsv_frame))
+
+        # Draw instructions on frame
+        cv2.putText(frame, "Click to sample HSV | 'c'=clear | 'q'=quit",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(frame, f"Samples: {len(hsv_values)}",
+                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        cv2.imshow("HSV Checker", frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('c'):
+            hsv_values.clear()
+            print("\nSamples cleared!")
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+    if hsv_values:
+        print(f"\n{'='*40}")
+        print("FINAL SUMMARY")
+        print(f"{'='*40}")
+        h_vals = [v[0] for v in hsv_values]
+        s_vals = [v[1] for v in hsv_values]
+        v_vals = [v[2] for v in hsv_values]
+        print(f"Collected {len(hsv_values)} samples")
+        print(f"H range: {min(h_vals)} - {max(h_vals)}")
+        print(f"S range: {min(s_vals)} - {max(s_vals)}")
+        print(f"V range: {min(v_vals)} - {max(v_vals)}")
+        print(f"\nSuggested threshold:")
+        print(f"lower = ({max(0, min(h_vals)-5)}, {max(0, min(s_vals)-20)}, {max(0, min(v_vals)-20)})")
+        print(f"upper = ({min(179, max(h_vals)+5)}, {min(255, max(s_vals)+20)}, {min(255, max(v_vals)+20)})")
+
+# Uncomment to run:
+hsv_checker()
 # %%
