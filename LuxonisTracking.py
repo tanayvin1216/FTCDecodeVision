@@ -1,3 +1,6 @@
+
+
+
 """
 3D ball trajectory tracking using a Luxonis OAK-D camera.
 
@@ -317,13 +320,19 @@ def main():
     pipeline = build_pipeline()
 
     with dai.Device(pipeline) as device:
+        usb_speed = device.getUsbSpeed()
+        print(f"USB speed: {usb_speed.name}")
+        if usb_speed == dai.UsbSpeed.HIGH:
+            print("WARNING: USB2 detected — USB3 required for full performance!")
+
         q_rgb = device.getOutputQueue("rgb", maxSize=4, blocking=False)
         q_depth = device.getOutputQueue("depth", maxSize=4, blocking=False)
 
         # Get RGB camera intrinsics for 3D projection
+        # 1080p with setIspScale(2, 3) = 1280x720
         calib = device.readCalibration()
-        rgb_width = q_rgb.get().getCvFrame().shape[1]
-        rgb_height = q_rgb.get().getCvFrame().shape[0]
+        rgb_width = 1280
+        rgb_height = 720
         intrinsics = np.array(
             calib.getCameraIntrinsics(dai.CameraBoardSocket.CAM_A, rgb_width, rgb_height)
         )
@@ -355,10 +364,8 @@ def main():
         prev_time = time.time()
 
         while True:
-            in_rgb = q_rgb.tryGet()
-            in_depth = q_depth.tryGet()
-            if in_rgb is None or in_depth is None:
-                continue
+            in_rgb = q_rgb.get()
+            in_depth = q_depth.get()
 
             frame = in_rgb.getCvFrame()
             depth_frame = in_depth.getFrame()
