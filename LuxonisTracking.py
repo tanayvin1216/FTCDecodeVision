@@ -7,8 +7,11 @@ real-time 3D ball positions and trajectory history.
 Requires: depthai, opencv-python, numpy
 """
 
+import csv
+import os
 import time
 from collections import deque
+from datetime import datetime
 
 import cv2
 import depthai as dai
@@ -18,6 +21,10 @@ from ballDetect import detect_balls
 
 # --- Configuration -----------------------------------------------------------
 
+HOOD_ANGLE = 0            # degrees
+RPM = 0                   # flywheel RPM
+CSV_FILE = "trajectory_experiments_3d.csv"
+
 MAX_TRAJECTORY_POINTS = 200
 DEPTH_MEDIAN_KERNEL = 7  # kernel size for median depth around detection center
 MIN_VALID_DEPTH_MM = 100
@@ -25,6 +32,16 @@ MAX_VALID_DEPTH_MM = 10000
 FPS = 30
 RGB_RESOLUTION = dai.ColorCameraProperties.SensorResolution.THE_1080_P
 MONO_RESOLUTION = dai.MonoCameraProperties.SensorResolution.THE_400_P
+
+CSV_HEADER = [
+    'Timestamp', 'Hood_Angle', 'RPM', 'Trial',
+    'Frame', 'Time_s',
+    'X_m', 'Y_m', 'Z_m',
+    'Vx_mps', 'Vy_mps', 'Vz_mps',
+    'Vi_x_mps', 'Vi_y_mps', 'Vi_z_mps',
+    'V_initial_mps', 'Launch_Angle_deg',
+    'Max_Height_m', 'Range_m',
+]
 
 
 # --- Pipeline ----------------------------------------------------------------
@@ -102,6 +119,118 @@ def get_median_depth(depth_frame, cx, cy, kernel=DEPTH_MEDIAN_KERNEL):
     if len(valid) == 0:
         return 0
     return int(np.median(valid))
+
+
+# --- CSV / Kinematics --------------------------------------------------------
+
+def ensure_csv_header(filepath):
+    """Create CSV with header if it doesn't exist yet."""
+    if not os.path.exists(filepath):
+        with open(filepath, 'w', newline='') as f:
+            csv.writer(f).writerow(CSV_HEADER)
+
+
+def count_existing_trials(filepath):
+    """Count how many trials already exist in the CSV."""
+    if not os.path.exists(filepath):
+        return 0
+    with open(filepath, 'r') as f:
+        reader = csv.reader(f)
+        next(reader)  # skip header
+        trials = set()
+        for row in reader:
+            if len(row) >= 4:
+                trials.add((row[1], row[2], row[3]))
+        return len(trials)
+
+
+def compute_kinematics_3d(points_3d, timestamps):
+    """
+    Compute 3D kinematics from (x, y, z) positions in meters.
+
+    Y is flipped so that up is positive (camera Y points down).
+
+    Returns dict with per-frame velocities, initial velocity,
+    launch angle, max height, and range.
+    """
+    # Use first point as origin, flip Y so up is positive
+    ox, oy, oz = points_3d[0]
+    pts = [(x - ox, -(y - oy), z - oz) for x, y, z in points_3d]
+
+    # Per-frame velocities via finite differences
+    vx_list, vy_list, vz_list = [], [], []
+    for i in range(len(pts)):
+        if i == 0:
+            dt = timestamps[1] - timestamps[0]
+            dx = pts[1][0] - pts[0][0]
+            dy = pts[1][1] - pts[0][1]
+            dz = pts[1][2] - pts[0][2]
+        elif i == len(pts) - 1:
+            dt = timestamps[-1] - timestamps[-2]
+            dx = pts[-1][0] - pts[-2][0]
+            dy = pts[-1][1] - pts[-2][1]
+            dz = pts[-1][2] - pts[-2][2]
+        else:
+            dt = (timestamps[i + 1] - timestamps[i - 1]) / 2
+            dx = (pts[i + 1][0] - pts[i - 1][0]) / 2
+            dy = (pts[i + 1][1] - pts[i - 1][1]) / 2
+            dz = (pts[i + 1][2] - pts[i - 1][2]) / 2
+        dt = max(dt, 1e-6)
+        vx_list.append(dx / dt)
+        vy_list.append(dy / dt)
+        vz_list.append(dz / dt)
+
+    # Initial velocity = average of first 3 frames
+    n = min(3, len(pts))
+    vix = np.mean(vx_list[:n])
+    viy = np.mean(vy_list[:n])
+    viz = np.mean(vz_list[:n])
+    v0 = np.sqrt(vix**2 + viy**2 + viz**2)
+
+    # Launch angle in the vertical plane (angle from horizontal)
+    horizontal_speed = np.sqrt(vix**2 + viz**2)
+    angle = np.degrees(np.arctan2(viy, horizontal_speed)) if horizontal_speed > 0 else 0.0
+
+    y_vals = [p[1] for p in pts]
+    max_height = max(y_vals)
+
+    # Range = horizontal distance (XZ plane) from start to end
+    total_range = np.sqrt(pts[-1][0]**2 + pts[-1][2]**2)
+
+    return {
+        'points': pts,
+        'vx_list': vx_list,
+        'vy_list': vy_list,
+        'vz_list': vz_list,
+        'vix': vix,
+        'viy': viy,
+        'viz': viz,
+        'v0': v0,
+        'angle': angle,
+        'max_height': max_height,
+        'range': total_range,
+    }
+
+
+def save_trial_3d(filepath, hood_angle, rpm, trial_num, timestamps, k):
+    """Append one trial's 3D data to the CSV."""
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    with open(filepath, 'a', newline='') as f:
+        writer = csv.writer(f)
+        for i in range(len(k['points'])):
+            writer.writerow([
+                timestamp, hood_angle, rpm, trial_num,
+                i, f"{timestamps[i] - timestamps[0]:.4f}",
+                f"{k['points'][i][0]:.6f}",
+                f"{k['points'][i][1]:.6f}",
+                f"{k['points'][i][2]:.6f}",
+                f"{k['vx_list'][i]:.4f}",
+                f"{k['vy_list'][i]:.4f}",
+                f"{k['vz_list'][i]:.4f}",
+                f"{k['vix']:.4f}", f"{k['viy']:.4f}", f"{k['viz']:.4f}",
+                f"{k['v0']:.4f}", f"{k['angle']:.2f}",
+                f"{k['max_height']:.6f}", f"{k['range']:.6f}",
+            ])
 
 
 # --- Visualization -----------------------------------------------------------
@@ -204,10 +333,23 @@ def main():
             "P": deque(maxlen=MAX_TRAJECTORY_POINTS),
         }
 
+        # --- CSV recording state ---
+        ensure_csv_header(CSV_FILE)
+        trial_num = count_existing_trials(CSV_FILE) + 1
+        recording = False
+        recorded_points_3d = []   # list of (x, y, z) in meters
+        recorded_timestamps = []  # list of time.time() values
+
         print("=" * 50)
         print("LUXONIS 3D BALL TRACKING")
-        print("  'c' = clear trajectories")
-        print("  'q' = quit")
+        print(f"  Hood Angle:  {HOOD_ANGLE} deg")
+        print(f"  RPM:         {RPM}")
+        print(f"  Trial #:     {trial_num}")
+        print(f"  Saving to:   {CSV_FILE}")
+        print()
+        print("  SPACE = start/stop recording")
+        print("  'c'   = clear trajectories")
+        print("  'q'   = quit")
         print("=" * 50)
 
         prev_time = time.time()
@@ -254,6 +396,18 @@ def main():
                     "t": time.time(),
                 })
 
+            # Record the largest ball's 3D position when recording
+            if recording and balls:
+                best = max(balls, key=lambda b: b["bbox"][2] * b["bbox"][3])
+                bx, by, bw, bh = best["bbox"]
+                bcx = bx + bw // 2
+                bcy = by + bh // 2
+                d_mm = get_median_depth(depth_frame, bcx, bcy)
+                if MIN_VALID_DEPTH_MM < d_mm < MAX_VALID_DEPTH_MM:
+                    pt = pixel_to_3d(bcx, bcy, d_mm, intrinsics)
+                    recorded_points_3d.append((pt[0], pt[1], pt[2]))
+                    recorded_timestamps.append(time.time())
+
             # Draw 2D trajectories on the RGB view
             for color_key, traj in trajectories.items():
                 color_bgr = (0, 255, 0) if color_key == "G" else (255, 0, 255)
@@ -265,6 +419,15 @@ def main():
             prev_time = now
             cv2.putText(output, f"FPS: {fps:.0f}", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+            # Recording status
+            info = f"Hood: {HOOD_ANGLE} | RPM: {RPM} | Trial: {trial_num}"
+            if recording:
+                cv2.putText(output, f"REC | {info} | Pts: {len(recorded_points_3d)}",
+                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            else:
+                cv2.putText(output, f"READY | {info}",
+                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
             # Depth colormap
             depth_vis = cv2.normalize(depth_frame, None, 0, 255, cv2.NORM_MINMAX)
@@ -287,6 +450,29 @@ def main():
                 for traj in trajectories.values():
                     traj.clear()
                 print("Trajectories cleared.")
+            elif key == ord(" "):
+                if not recording:
+                    recorded_points_3d.clear()
+                    recorded_timestamps.clear()
+                    recording = True
+                    print("Recording started...")
+                else:
+                    recording = False
+                    if len(recorded_points_3d) >= 2:
+                        k = compute_kinematics_3d(recorded_points_3d, recorded_timestamps)
+                        save_trial_3d(CSV_FILE, HOOD_ANGLE, RPM, trial_num,
+                                      recorded_timestamps, k)
+                        print(f"\nTrial {trial_num} saved ({len(recorded_points_3d)} points)")
+                        print(f"  Vi_x:         {k['vix']:.3f} m/s")
+                        print(f"  Vi_y:         {k['viy']:.3f} m/s")
+                        print(f"  Vi_z:         {k['viz']:.3f} m/s")
+                        print(f"  V_initial:    {k['v0']:.3f} m/s")
+                        print(f"  Launch Angle: {k['angle']:.1f} deg")
+                        print(f"  Max Height:   {k['max_height']:.3f} m")
+                        print(f"  Range:        {k['range']:.3f} m")
+                        trial_num += 1
+                    else:
+                        print("Not enough points — trial discarded")
 
         cv2.destroyAllWindows()
 
