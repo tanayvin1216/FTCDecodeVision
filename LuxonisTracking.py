@@ -42,6 +42,9 @@ CSV_HEADER = [
     'Vi_x_mps', 'Vi_y_mps', 'Vi_z_mps',
     'V_initial_mps', 'Launch_Angle_deg',
     'Max_Height_m', 'Range_m',
+    'Fit_X_a', 'Fit_X_b', 'Fit_X_c',
+    'Fit_Y_a', 'Fit_Y_b', 'Fit_Y_c',
+    'Fit_Z_a', 'Fit_Z_b', 'Fit_Z_c',
 ]
 
 
@@ -180,6 +183,12 @@ def compute_kinematics_3d(points_3d, timestamps):
     # Range = horizontal distance (XZ plane) from start to end
     total_range = np.sqrt(pts[-1][0]**2 + pts[-1][2]**2)
 
+    # Quadratic fit coefficients: axis(t) = a*t^2 + b*t + c
+    t = np.array([ts - timestamps[0] for ts in timestamps])
+    fit_x = np.polyfit(t, [p[0] for p in pts], 2) if len(pts) >= 3 else [0, 0, 0]
+    fit_y = np.polyfit(t, [p[1] for p in pts], 2) if len(pts) >= 3 else [0, 0, 0]
+    fit_z = np.polyfit(t, [p[2] for p in pts], 2) if len(pts) >= 3 else [0, 0, 0]
+
     return {
         'points': pts,
         'vx_list': vx_list,
@@ -192,6 +201,9 @@ def compute_kinematics_3d(points_3d, timestamps):
         'angle': angle,
         'max_height': max_height,
         'range': total_range,
+        'fit_x': fit_x,
+        'fit_y': fit_y,
+        'fit_z': fit_z,
     }
 
 
@@ -213,18 +225,58 @@ def save_trial_3d(filepath, hood_angle, rpm, trial_num, timestamps, k):
                 f"{k['vix']:.4f}", f"{k['viy']:.4f}", f"{k['viz']:.4f}",
                 f"{k['v0']:.4f}", f"{k['angle']:.2f}",
                 f"{k['max_height']:.6f}", f"{k['range']:.6f}",
+                f"{k['fit_x'][0]:.6f}", f"{k['fit_x'][1]:.6f}", f"{k['fit_x'][2]:.6f}",
+                f"{k['fit_y'][0]:.6f}", f"{k['fit_y'][1]:.6f}", f"{k['fit_y'][2]:.6f}",
+                f"{k['fit_z'][0]:.6f}", f"{k['fit_z'][1]:.6f}", f"{k['fit_z'][2]:.6f}",
             ])
+
+
+# --- Quadratic curve fitting -------------------------------------------------
+
+def _fit_and_sample(coords_a, coords_b, n_between=10):
+    """Fit a quadratic to 2D coords parametrically and return smooth pixel points.
+
+    coords_a and coords_b are arrays of the two screen-space axes.
+    The curve is parameterized by index (not by either axis) so it always
+    follows the natural order of the data — no weird loops or pull-offs.
+
+    Returns a list of (int, int) pixel points along the smooth curve,
+    or the raw points if there aren't enough for a fit.
+    """
+    n = len(coords_a)
+    if n < 3:
+        return list(zip(coords_a.astype(int), coords_b.astype(int)))
+
+    t = np.arange(n, dtype=float)
+    ca = np.polyfit(t, coords_a, 2)
+    cb = np.polyfit(t, coords_b, 2)
+
+    # Dense samples between each pair of original points
+    t_smooth = np.linspace(0, n - 1, (n - 1) * n_between + 1)
+    a_smooth = np.polyval(ca, t_smooth)
+    b_smooth = np.polyval(cb, t_smooth)
+
+    return list(zip(a_smooth.astype(int), b_smooth.astype(int)))
 
 
 # --- Visualization -----------------------------------------------------------
 
 def draw_trajectory_2d(frame, trajectory, color_bgr):
-    """Draw the 2D projection of a trajectory on the frame."""
-    pts = [(int(p["px"]), int(p["py"])) for p in trajectory]
-    for i in range(1, len(pts)):
-        alpha = i / len(pts)
-        thick = max(1, int(alpha * 3))
-        cv2.line(frame, pts[i - 1], pts[i], color_bgr, thick)
+    """Draw a smooth quadratic-fit 2D trajectory with raw point markers."""
+    if len(trajectory) < 2:
+        return
+
+    px = np.array([p["px"] for p in trajectory], dtype=float)
+    py = np.array([p["py"] for p in trajectory], dtype=float)
+    smooth = _fit_and_sample(px, py)
+
+    # Draw the smooth curve
+    for i in range(1, len(smooth)):
+        cv2.line(frame, smooth[i - 1], smooth[i], color_bgr, 2)
+
+    # Draw raw data point markers so you can see the actual measurements
+    for p in trajectory:
+        cv2.circle(frame, (int(p["px"]), int(p["py"])), 3, (0, 0, 255), -1)
 
 
 def draw_3d_info(frame, ball_3d, label, color_bgr, position):
@@ -235,39 +287,39 @@ def draw_3d_info(frame, ball_3d, label, color_bgr, position):
 
 
 def draw_top_down_view(trajectories, view_size=300):
-    """Render a simple top-down (X-Z plane) view of all trajectories."""
+    """Render a top-down (X-Z plane) view with smooth quadratic-fit curves."""
     view = np.zeros((view_size, view_size, 3), dtype=np.uint8)
 
-    # axes
     mid = view_size // 2
     cv2.line(view, (mid, 0), (mid, view_size), (40, 40, 40), 1)
     cv2.line(view, (0, view_size), (view_size, view_size), (40, 40, 40), 1)
     cv2.putText(view, "Top-down (XZ)", (5, 15),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
 
-    scale = 100  # pixels per meter
+    scale = 100
 
     for color_key, traj in trajectories.items():
+        if len(traj) < 2:
+            continue
         color_bgr = (0, 255, 0) if color_key == "G" else (255, 0, 255)
-        pts = []
+
+        screen_x = np.array([mid + p["x"] * scale for p in traj])
+        screen_y = np.array([view_size - p["z"] * scale for p in traj])
+        smooth = _fit_and_sample(screen_x, screen_y)
+
+        for i in range(1, len(smooth)):
+            cv2.line(view, smooth[i - 1], smooth[i], color_bgr, 2)
+
+        # Raw point markers
         for p in traj:
-            px = int(mid + p["x"] * scale)
-            py = int(view_size - p["z"] * scale)
-            pts.append((px, py))
-
-        for i in range(1, len(pts)):
-            alpha = i / len(pts)
-            thick = max(1, int(alpha * 2))
-            cv2.line(view, pts[i - 1], pts[i], color_bgr, thick)
-
-        if pts:
-            cv2.circle(view, pts[-1], 4, color_bgr, -1)
+            pt = (int(mid + p["x"] * scale), int(view_size - p["z"] * scale))
+            cv2.circle(view, pt, 3, (0, 0, 255), -1)
 
     return view
 
 
 def draw_side_view(trajectories, view_size=300):
-    """Render a side view (Z-Y plane) of all trajectories."""
+    """Render a side view (Z-Y plane) with smooth quadratic-fit curves."""
     view = np.zeros((view_size, view_size, 3), dtype=np.uint8)
     cv2.putText(view, "Side (ZY)", (5, 15),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
@@ -276,20 +328,21 @@ def draw_side_view(trajectories, view_size=300):
     mid_y = view_size // 2
 
     for color_key, traj in trajectories.items():
+        if len(traj) < 2:
+            continue
         color_bgr = (0, 255, 0) if color_key == "G" else (255, 0, 255)
-        pts = []
+
+        screen_x = np.array([p["z"] * scale for p in traj])
+        screen_y = np.array([mid_y - p["y"] * scale for p in traj])
+        smooth = _fit_and_sample(screen_x, screen_y)
+
+        for i in range(1, len(smooth)):
+            cv2.line(view, smooth[i - 1], smooth[i], color_bgr, 2)
+
+        # Raw point markers
         for p in traj:
-            px = int(p["z"] * scale)
-            py = int(mid_y - p["y"] * scale)
-            pts.append((px, py))
-
-        for i in range(1, len(pts)):
-            alpha = i / len(pts)
-            thick = max(1, int(alpha * 2))
-            cv2.line(view, pts[i - 1], pts[i], color_bgr, thick)
-
-        if pts:
-            cv2.circle(view, pts[-1], 4, color_bgr, -1)
+            pt = (int(p["z"] * scale), int(mid_y - p["y"] * scale))
+            cv2.circle(view, pt, 3, (0, 0, 255), -1)
 
     return view
 
@@ -443,6 +496,8 @@ def main():
                 if not recording:
                     recorded_points_3d.clear()
                     recorded_timestamps.clear()
+                    for traj in trajectories.values():
+                        traj.clear()
                     recording = True
                     print("Recording started...")
                 else:
