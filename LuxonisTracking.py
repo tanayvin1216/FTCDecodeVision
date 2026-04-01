@@ -33,8 +33,6 @@ DEPTH_MEDIAN_KERNEL = 7  # kernel size for median depth around detection center
 MIN_VALID_DEPTH_MM = 100
 MAX_VALID_DEPTH_MM = 10000
 FPS = 30
-RGB_RESOLUTION = dai.ColorCameraProperties.SensorResolution.THE_1080_P
-MONO_RESOLUTION = dai.MonoCameraProperties.SensorResolution.THE_400_P
 
 CSV_HEADER = [
     'Timestamp', 'Hood_Angle', 'RPM', 'Trial',
@@ -53,46 +51,28 @@ def build_pipeline():
     """Build a DepthAI pipeline: RGB + stereo depth, both synced."""
     pipeline = dai.Pipeline()
 
-    # Color camera
-    cam_rgb = pipeline.create(dai.node.ColorCamera)
-    cam_rgb.setResolution(RGB_RESOLUTION)
-    cam_rgb.setInterleaved(False)
-    cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
-    cam_rgb.setFps(FPS)
-    cam_rgb.setIspScale(2, 3)  # downscale for performance (720p)
+    # RGB camera (Camera node replaces deprecated ColorCamera)
+    cam_rgb = pipeline.create(dai.node.Camera)
+    cam_rgb.build(dai.CameraBoardSocket.CAM_A)
+    rgb_out = cam_rgb.requestOutput((1280, 720), dai.ImgFrame.Type.BGR888p, fps=FPS)
 
     # Stereo pair
-    mono_left = pipeline.create(dai.node.MonoCamera)
-    mono_right = pipeline.create(dai.node.MonoCamera)
-    mono_left.setResolution(MONO_RESOLUTION)
-    mono_right.setResolution(MONO_RESOLUTION)
-    mono_left.setBoardSocket(dai.CameraBoardSocket.CAM_B)
-    mono_right.setBoardSocket(dai.CameraBoardSocket.CAM_C)
-    mono_left.setFps(FPS)
-    mono_right.setFps(FPS)
+    left = pipeline.create(dai.node.Camera)
+    left.build(dai.CameraBoardSocket.CAM_B)
+    right = pipeline.create(dai.node.Camera)
+    right.build(dai.CameraBoardSocket.CAM_C)
 
     # Stereo depth
     stereo = pipeline.create(dai.node.StereoDepth)
-    stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
+    stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.FAST_DENSITY)
     stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)  # align depth to RGB
-    stereo.setOutputSize(
-        cam_rgb.getIspWidth(), cam_rgb.getIspHeight()
-    )
+    stereo.setOutputSize(1280, 720)
     stereo.initialConfig.setMedianFilter(dai.MedianFilter.KERNEL_7x7)
 
-    mono_left.out.link(stereo.left)
-    mono_right.out.link(stereo.right)
+    left.requestOutput((640, 400), fps=FPS).link(stereo.left)
+    right.requestOutput((640, 400), fps=FPS).link(stereo.right)
 
-    # Outputs
-    xout_rgb = pipeline.create(dai.node.XLinkOut)
-    xout_rgb.setStreamName("rgb")
-    cam_rgb.isp.link(xout_rgb.input)
-
-    xout_depth = pipeline.create(dai.node.XLinkOut)
-    xout_depth.setStreamName("depth")
-    stereo.depth.link(xout_depth.input)
-
-    return pipeline
+    return pipeline, rgb_out, stereo.depth
 
 
 # --- 3D projection ----------------------------------------------------------
@@ -317,19 +297,21 @@ def draw_side_view(trajectories, view_size=300):
 # --- Main loop ---------------------------------------------------------------
 
 def main():
-    pipeline = build_pipeline()
+    pipeline, rgb_out, depth_out = build_pipeline()
 
-    with dai.Device(pipeline) as device:
-        usb_speed = device.getUsbSpeed()
-        print(f"USB speed: {usb_speed.name}")
-        if usb_speed == dai.UsbSpeed.HIGH:
-            print("WARNING: USB2 detected — USB3 required for full performance!")
+    q_rgb = rgb_out.createOutputQueue(maxSize=4, blocking=False)
+    q_depth = depth_out.createOutputQueue(maxSize=4, blocking=False)
 
-        q_rgb = device.getOutputQueue("rgb", maxSize=4, blocking=False)
-        q_depth = device.getOutputQueue("depth", maxSize=4, blocking=False)
+    pipeline.start()
+    device = pipeline.getDefaultDevice()
 
+    usb_speed = device.getUsbSpeed()
+    print(f"USB speed: {usb_speed.name}")
+    if usb_speed == dai.UsbSpeed.HIGH:
+        print("WARNING: USB2 detected — USB3 required for full performance!")
+
+    try:
         # Get RGB camera intrinsics for 3D projection
-        # 1080p with setIspScale(2, 3) = 1280x720
         calib = device.readCalibration()
         rgb_width = 1280
         rgb_height = 720
@@ -481,7 +463,9 @@ def main():
                     else:
                         print("Not enough points — trial discarded")
 
+    finally:
         cv2.destroyAllWindows()
+        device.close()
 
 
 if __name__ == "__main__":
